@@ -23,6 +23,7 @@ import re
 import asyncio
 import base64
 import resend
+from hubspot_client import create_hubspot_contact
 
 
 # ============================================================
@@ -337,6 +338,53 @@ async def update_content(
 
 
 # ============================================================
+# Site Config (browser tab title, meta description, etc.)
+# ============================================================
+@api_router.get("/site-config")
+async def get_site_config():
+    """Public: get the browser tab title and meta description."""
+    cfg = await db.site_config.find_one({"_id": "main"})
+    if not cfg:
+        return {
+            "siteTitle": "CollectPay | Recupera tu flujo de caja",
+            "siteDescription": "Plataforma fintech con IA para PYMEs. Aumenta tu recuperación de cartera hasta un 45% y reduce costos operativos hasta un 80%."
+        }
+    return {
+        "siteTitle": cfg.get("siteTitle", "CollectPay | Recupera tu flujo de caja"),
+        "siteDescription": cfg.get("siteDescription", "")
+    }
+
+
+class SiteConfigPayload(BaseModel):
+    siteTitle: str = Field(..., min_length=1, max_length=120)
+    siteDescription: Optional[str] = Field(default="", max_length=300)
+
+
+@api_router.put("/site-config")
+async def update_site_config(
+    payload: SiteConfigPayload,
+    current_user: dict = Depends(get_current_user)
+):
+    """Admin only: update the browser tab title and meta description."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    site_title = sanitize_string(payload.siteTitle, max_length=120)
+    site_description = sanitize_string(payload.siteDescription or "", max_length=300)
+
+    await db.site_config.update_one(
+        {"_id": "main"},
+        {"$set": {
+            "siteTitle": site_title,
+            "siteDescription": site_description,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }},
+        upsert=True
+    )
+    return {"message": "Site config updated", "siteTitle": site_title}
+
+
+# ============================================================
 # Contact Form Endpoint
 # ============================================================
 @api_router.get("/captcha", response_model=CaptchaResponse)
@@ -403,6 +451,17 @@ async def submit_contact(request: Request, submission: ContactSubmission):
         await send_lead_notification(doc)
     except Exception as e:
         logger.error(f"Email notification error: {e}")
+    
+    # Push lead to HubSpot CRM (non-blocking — never breaks the form)
+    try:
+        hubspot_id = await create_hubspot_contact(doc)
+        if hubspot_id:
+            await db.contact_submissions.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"hubspot_contact_id": hubspot_id}}
+            )
+    except Exception as e:
+        logger.error(f"HubSpot sync error: {e}")
     
     return {"message": "Solicitud recibida", "id": str(result.inserted_id)}
 
