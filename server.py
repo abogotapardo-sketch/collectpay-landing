@@ -11,6 +11,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
 from bson import ObjectId
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -36,7 +37,58 @@ db = client[os.environ['DB_NAME']]
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
-app = FastAPI(title="CollectPay API")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Lifespan (replaces deprecated @app.on_event)
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- Startup ----
+    try:
+        # Indexes
+        await db.users.create_index("email", unique=True)
+        await db.login_attempts.create_index("identifier")
+
+        # Seed admin
+        admin_email = os.environ.get("ADMIN_EMAIL", "admin@collectpay.co").lower()
+        admin_password = os.environ.get("ADMIN_PASSWORD", "CollectPay2026!")
+
+        existing = await db.users.find_one({"email": admin_email})
+        if existing is None:
+            await db.users.insert_one({
+                "email": admin_email,
+                "password_hash": hash_password(admin_password),
+                "name": "Admin",
+                "role": "admin",
+                "created_at": datetime.now(timezone.utc)
+            })
+            logger.info(f"✅ Admin user created: {admin_email}")
+        elif not verify_password(admin_password, existing["password_hash"]):
+            await db.users.update_one(
+                {"email": admin_email},
+                {"$set": {"password_hash": hash_password(admin_password)}}
+            )
+            logger.info(f"✅ Admin password updated: {admin_email}")
+        else:
+            logger.info(f"✅ Admin user exists: {admin_email}")
+    except Exception as e:
+        # Don't crash the app if DB is momentarily unreachable.
+        # Server will still respond and retry on first request.
+        logger.error(f"⚠️ Startup task failed (server will continue): {e}")
+
+    yield
+
+    # ---- Shutdown ----
+    try:
+        client.close()
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
+
+
+app = FastAPI(title="CollectPay API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -58,9 +110,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 JWT_ALGORITHM = "HS256"
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -630,41 +679,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ============================================================
-# Startup: Seed admin + indexes
-# ============================================================
-@app.on_event("startup")
-async def startup_event():
-    # Indexes
-    await db.users.create_index("email", unique=True)
-    await db.login_attempts.create_index("identifier")
-    
-    # Seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@collectpay.co").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "CollectPay2026!")
-    
-    existing = await db.users.find_one({"email": admin_email})
-    if existing is None:
-        await db.users.insert_one({
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Admin",
-            "role": "admin",
-            "created_at": datetime.now(timezone.utc)
-        })
-        logger.info(f"✅ Admin user created: {admin_email}")
-    elif not verify_password(admin_password, existing["password_hash"]):
-        await db.users.update_one(
-            {"email": admin_email},
-            {"$set": {"password_hash": hash_password(admin_password)}}
-        )
-        logger.info(f"✅ Admin password updated: {admin_email}")
-    else:
-        logger.info(f"✅ Admin user exists: {admin_email}")
-
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
